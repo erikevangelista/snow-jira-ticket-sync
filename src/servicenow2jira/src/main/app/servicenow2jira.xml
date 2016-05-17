@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:servicenow="http://www.mulesoft.org/schema/mule/servicenow" xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw" xmlns:metadata="http://www.mulesoft.org/schema/mule/metadata" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:jirarest="http://www.mulesoft.org/schema/mule/jirarest" xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+http://www.mulesoft.org/schema/mule/jirarest http://www.mulesoft.org/schema/mule/jirarest/current/mule-jirarest.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/servicenow http://www.mulesoft.org/schema/mule/servicenow/current/mule-servicenow.xsd">
+    <http:listener-config name="HTTP_Listener_Configuration" host="0.0.0.0" port="8081" doc:name="HTTP Listener Configuration"/>
+    <jirarest:config-type name="JiraRest__Basic_Authentification" username="${jira.user}" password="${jira.pass}" serverUrl="${jira.api.rest}" doc:name="JiraRest: Basic Authentification"/>
+    <servicenow:config name="ServiceNow__configuration" username="${servicenow.username}" password="${servicenow.password}" serviceAddress="${servicenow.address}" doc:name="ServiceNow: configuration" serviceNowVersion="FUJI"/>
+    <queued-asynchronous-processing-strategy name="Queued_Asynchronous_Processing_Strategy" doc:name="Queued Asynchronous Processing Strategy"/>
+    <asynchronous-processing-strategy name="Asynchronous_Processing_Strategy" doc:name="Asynchronous Processing Strategy"/>
+    <flow name="Bug_Reported_in_SN">
+        <http:listener config-ref="HTTP_Listener_Configuration" path="/SN/ReportBug/{sys_id}" doc:name="HTTP /SN/ReportBug/{sys_id}"/>
+        <set-variable variableName="sys_id" value="#[message.inboundProperties.'http.uri.params'.sys_id]" doc:name="Set sys_id Variable"/>
+        <dw:transform-message doc:name="Transform XML Message">
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/xml
+%namespace ns0 http://www.service-now.com/incident
+---
+{
+	ns0#get: {
+		ns0#sys_id: flowVars.sys_id
+	}
+}]]></dw:set-payload>
+        </dw:transform-message>
+        <async processingStrategy="Asynchronous_Processing_Strategy" doc:name="Async">
+            <servicenow:invoke config-ref="ServiceNow__configuration" type="incident||get" doc:name="Get SN Incident Fields"/>
+            <dw:transform-message doc:name="Transform Message">
+                <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+ {
+    fields: {
+    	project: {
+             "key": "SNOW"
+        },
+        "issuetype": {
+         	"name": "Bug"
+       	},
+        "summary": payload.getResponse.short_description,
+        "customfield_10025": flowVars.sys_id
+    }
+ }]]></dw:set-payload>
+            </dw:transform-message>
+            <jirarest:issues-issue-create config-ref="JiraRest__Basic_Authentification" entityType="Issue" doc:name="JiraRest_createIssue"/>
+            <dw:transform-message doc:name="Transform Message">
+                <dw:set-payload><![CDATA[%dw 1.0
+%output application/json
+---
+payload]]></dw:set-payload>
+            </dw:transform-message>
+            <set-variable variableName="issue_id" value="#[json:id]" mimeType="text/plain" doc:name="Set issue_id Variable"/>
+            <tracking:custom-event event-name="JIRA Issue Created" doc:name="Custom Business Event">
+                <tracking:meta-data key="Issue Id" value="#[flowVars.issue_id]"/>
+            </tracking:custom-event>
+            <dw:transform-message doc:name="Transform Message">
+                <dw:set-payload><![CDATA[%dw 1.0
+%output application/xml
+%namespace ns0 http://www.service-now.com/incident
+---
+{
+	ns0#update: {
+		ns0#sys_id: flowVars.sys_id,
+		ns0#u_jira_issue: flowVars.issue_id
+	}
+}]]></dw:set-payload>
+            </dw:transform-message>
+            <servicenow:invoke config-ref="ServiceNow__configuration" type="incident||update" doc:name="Update SN Incident"/>
+            <logger message="ServiceNow sys_id = #[flowVars.sys_id] and JIRA issue_id = #[flowVars.issue_id]" level="INFO" doc:name="Log for Records"/>
+        </async>
+    </flow>
+    <flow name="Issue_Updated_in_JIRA">
+        <http:listener config-ref="HTTP_Listener_Configuration" path="/api/JIRA/{issue_id}" doc:name="HTTP /api/JIRA/{issue_id}"/>
+        <set-variable variableName="issue_id" value="#[(message.inboundProperties.'http.uri.params'.issue_id == empty) ? '1003' : message.inboundProperties.'http.uri.params'.issue_id]" doc:name="Set issue_id Variable"/>
+        <jirarest:issues-issue-get config-ref="JiraRest__Basic_Authentification" entityType="Issue" fields="customfield_10025,status,comment" issueKeyOrId="#[flowVars.issue_id]" doc:name="JiraRest_getIssueStatus"/>
+        <dw:transform-message doc:name="Transform Message">
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+{
+	"id": payload.id,
+	"key": payload.key,
+	"status": payload.fields.status.statusCategory.name,
+	"sys_id": payload.fields.customfield_10025,
+	"comments": payload.fields.comment.comments[-1].body
+}
+]]></dw:set-payload>
+        </dw:transform-message>
+        <logger message="Logging: #[payload.id +' status =' + payload.status + ' sys_id=' + payload.sys_id]" level="INFO" doc:name="Logger"/>
+        <choice doc:name="Choice">
+            <when expression="#[payload.status == 'Done']">
+                <dw:transform-message doc:name="Transform Closure Message">
+                    <dw:set-payload><![CDATA[%dw 1.0
+%output application/xml
+%namespace ns0 http://www.service-now.com/incident
+---
+{
+	ns0#update: {
+		ns0#sys_id: payload.sys_id,
+		ns0#incident_state: 6, //resolved
+		ns0#close_code: "Solved (Work Around)",
+		ns0#close_notes: payload.comments
+	}
+}]]></dw:set-payload>
+                </dw:transform-message>
+            </when>
+            <otherwise>
+                <dw:transform-message doc:name="Transform Update Message">
+                    <dw:set-payload><![CDATA[%dw 1.0
+%output application/xml
+%namespace ns0 http://www.service-now.com/incident
+---
+{
+	ns0#update: {
+		ns0#sys_id: payload.sys_id,
+		ns0#comments: payload.comments
+	}
+}]]></dw:set-payload>
+                </dw:transform-message>
+            </otherwise>
+        </choice>
+        <servicenow:invoke config-ref="ServiceNow__configuration" type="incident||update" doc:name="Update SN Incident"/>
+        <dw:transform-message doc:name="Transform Return Message">
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/json
+---
+payload]]></dw:set-payload>
+        </dw:transform-message>
+    </flow>
+</mule>
