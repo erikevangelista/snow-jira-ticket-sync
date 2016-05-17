@@ -1,1 +1,0 @@
-# snow-jira-ticket-sync
